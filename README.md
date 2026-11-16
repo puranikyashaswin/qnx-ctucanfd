@@ -204,7 +204,7 @@ What the tests cover, with the numbers: [docs/TESTS.md](docs/TESTS.md). In short
 - One active core per board (the two cores share one interrupt line in QEMU's model).
 - Acceptance filtering is in software only. QEMU 6.2's model has no acceptance filters (it ignores the filter registers and stores every frame), and the driver does not program the core's filters.
 - Frame timestamps and `CAN_DEVCTL_GET_TIMESTAMP` are 32-bit microseconds and wrap every 2^32 us. `CTUCAN_DEVCTL_GET_TIMESTAMP64` gives the same clock as 64 bits, with the same low 32 bits (`canfd-test time`).
-- Devctl latency has no upper bound: a sustained interrupt load at a priority above the clients' can delay them.
+- Devctl latency has no upper bound: a sustained interrupt load at a priority above the clients' can delay them. A `SET_TIMING` restart also waits up to 20 ms on libcan's thread for TXT buffer aborts; bus-off does not wait (`docs/DESIGN.md`, section 8).
 - Two nodes are two QEMU virtual machines joined by the host's vcan; no physical CAN bus was used.
 - The aarch64le build compiles and links and has not run.
 
