@@ -97,7 +97,8 @@ struct drv {
 
     /* TX */
     txslot_t txs[CTUCAN_TXT_BUFFERS];
-    unsigned txb_head, txb_tail;    /* running counters; buffer = counter % ntxb */
+    unsigned txb_head, txb_tail;    /* next TXT buffer to fill, oldest in flight */
+    unsigned txb_n;                 /* frames in TXT buffers */
     unsigned tx_rr;
     uint32_t tx_seq;
     bool     tx_stopped;            /* restart or shutdown in progress */
@@ -143,7 +144,7 @@ static void fi_tick(drv_t *d);
 
 static unsigned tx_inflight(const drv_t *d)
 {
-    return d->txb_head - d->txb_tail;
+    return d->txb_n;
 }
 
 static bool tx_admit(const drv_t *d)
@@ -159,7 +160,7 @@ static void tx_set_prio(drv_t *d)
         return;
     }
 #endif
-    ctucan_hw_tx_prio(&d->hw, d->ntxb, d->txb_tail % d->ntxb);
+    ctucan_hw_tx_prio(&d->hw, d->ntxb, d->txb_tail);
 }
 
 /* Takes the next queued frame, round robin across TX mailboxes. */
@@ -182,7 +183,7 @@ static void tx_kick(drv_t *d)
     unsigned ready = 0;
 
     while (tx_admit(d) && tx_inflight(d) < d->ntxb) {
-        unsigned b = d->txb_head % d->ntxb;
+        unsigned b = d->txb_head;
         if (!ctucan_txt_writable(ctucan_hw_txt_state(&d->hw, b))) {
             break;  /* its state change interrupt brings us back */
         }
@@ -216,7 +217,8 @@ static void tx_kick(drv_t *d)
         s->ext = m.ext.is_extended_mid != 0;
         s->rtr = m.ext.is_remote_frame != 0;
         s->late = false;
-        d->txb_head++;
+        d->txb_head = (b + 1) % d->ntxb;
+        d->txb_n++;
         d->x.tx_started++;
         ready |= 1u << b;
         if (tx_inflight(d) > d->x.tx_max_inflight) {
@@ -241,7 +243,7 @@ static unsigned tx_retire(drv_t *d)
     unsigned n = 0;
 
     while (tx_inflight(d) > 0) {
-        unsigned b = d->txb_tail % d->ntxb;
+        unsigned b = d->txb_tail;
         unsigned st = TXT_STATE(ts, b);
 
         switch (st) {
@@ -267,8 +269,8 @@ static unsigned tx_retire(drv_t *d)
         default:
             /* Ready, in transmission or aborting. Later buffers have lower
              * priority, so one of them finishing first is an ordering fault. */
-            for (unsigned k = d->txb_tail + 1; k != d->txb_head; k++) {
-                unsigned o = k % d->ntxb;
+            for (unsigned k = 1; k < d->txb_n; k++) {
+                unsigned o = (b + k) % d->ntxb;
                 if (!d->txs[o].late && TXT_STATE(ts, o) == TXT_TOK) {
                     d->txs[o].late = true;
                     d->x.tx_order_err++;
@@ -276,7 +278,8 @@ static unsigned tx_retire(drv_t *d)
             }
             return n;
         }
-        d->txb_tail++;
+        d->txb_tail = (b + 1) % d->ntxb;
+        d->txb_n--;
         if (d->ntxb > 1) {
             tx_set_prio(d);
         }
@@ -293,8 +296,8 @@ static void tx_abort_inflight(drv_t *d)
     uint32_t ts = ctucan_rd(&d->hw, CTUCAN_TX_STATUS);
     unsigned mask = 0;
 
-    for (unsigned k = d->txb_tail; k != d->txb_head; k++) {
-        unsigned b = k % d->ntxb;
+    for (unsigned k = 0; k < d->txb_n; k++) {
+        unsigned b = (d->txb_tail + k) % d->ntxb;
         unsigned st = TXT_STATE(ts, b);
         if (st == TXT_RDY || st == TXT_TRAN) {
             mask |= 1u << b;
@@ -319,6 +322,7 @@ static void tx_force_retire(drv_t *d)
     d->x.tx_aborted += n;
     can_slogf(SLOG2_ERROR, DRV_NAME ": %u TXT buffer(s) did not finish or abort in time, dropped", n);
     d->txb_tail = d->txb_head;
+    d->txb_n = 0;
     if (d->ntxb > 1) {
         tx_set_prio(d);
     }
@@ -629,7 +633,9 @@ static CANDEV *next_report(drv_t *d)
     return NULL;
 }
 
-static void finish_pulse(drv_t *d)
+/* `unmask` is false for a fault-injection tick (CTUCAN_FI): no interrupt was
+ * masked for it, so it only re-arms the core's output. */
+static void finish_pulse(drv_t *d, bool unmask)
 {
     /* RBNEI stays set while reader notifications are left, so the core
      * interrupts again and the next pulse continues them. Once they are done
@@ -647,7 +653,7 @@ static void finish_pulse(drv_t *d)
      * controller treats a line that is already asserted when it is unmasked
      * (section 3.3). */
     suppress(d);
-    if (InterruptUnmask(0, d->iid) == -1 && d->x.unmask_err++ == 0) {
+    if (unmask && InterruptUnmask(0, d->iid) == -1 && d->x.unmask_err++ == 0) {
         can_slogf(SLOG2_ERROR, DRV_NAME ": InterruptUnmask: %s", strerror(errno));
     }
     if (!d->hw_started) {
@@ -666,6 +672,21 @@ static void finish_pulse(drv_t *d)
     unsuppress(d);
 }
 
+/* The start of an interrupt pulse, after the fault-injection script has
+ * advanced: one bounded batch of service, then the reader notifications are
+ * counted from here. */
+static void pulse_begin(drv_t *d)
+{
+    d->in_event = true;
+    d->notify_left = false;
+    if (d->hw_started) {
+        service(d);
+    }
+    d->reports_left = d->report_budget;
+    d->rep_stuck = 0;
+    d->last_rep = NULL;
+}
+
 static CANDEV *cb_event(void *const hdl, const int code)
 {
     drv_t *d = hdl;
@@ -676,15 +697,8 @@ static CANDEV *cb_event(void *const hdl, const int code)
             return NULL;
         }
         d->x.hw_pulses++;
-        d->in_event = true;
-        d->notify_left = false;
         fi_tick(d);
-        if (d->hw_started) {
-            service(d);
-        }
-        d->reports_left = d->report_budget;
-        d->rep_stuck = 0;
-        d->last_rep = NULL;
+        pulse_begin(d);
     }
     CANDEV *c;
     while ((c = next_report(d)) != NULL) {
@@ -695,7 +709,7 @@ static CANDEV *cb_event(void *const hdl, const int code)
 #endif
         return c;
     }
-    finish_pulse(d);
+    finish_pulse(d, true);
     d->in_event = false;
     return NULL;
 }
@@ -711,24 +725,27 @@ static void fi_tick(drv_t *d)
 }
 
 /* CTUCAN_DEVCTL_FI_TICK, sent by a test client every millisecond while a
- * scenario runs: advances the script and handles the injected error and TX
- * events. RX is left to interrupt pulses, which also wake the readers. */
+ * scenario runs. Injected status never reaches the interrupt line, so when
+ * the script has some pending the tick runs the pulse path itself: the same
+ * service() batch and finish_pulse(), without the unmask. A devctl cannot
+ * hand mailboxes back to libcan, so readers that frames reached here are
+ * left to the next interrupt pulse: RBNEI stays set for it. */
 static void fi_devctl_tick(drv_t *d)
 {
     fi_tick(d);
-    if (!d->hw_started) {
+    if (d->in_event || !d->hw_started || (ctucan_fi_pending(d->hw.fi) & d->int_ena) == 0) {
         return;
     }
-    uint32_t st = ctucan_rd(&d->hw, CTUCAN_INT_STAT) & d->int_ena & (INT_TXBHCI | INT_EWLI | INT_FCSI | INT_BEI);
-    if (st & (INT_EWLI | INT_FCSI | INT_BEI)) {
-        ctucan_wr(&d->hw, CTUCAN_INT_STAT, st & (INT_EWLI | INT_FCSI | INT_BEI));
-        error_event(d, st);
+    d->x.fi_pulses++;
+    pulse_begin(d);
+    for (unsigned i = 0; i < d->nrx; i++) {
+        CANDEV *c = &d->rx[i].cdev;
+        if (c->msg_queue->msgcnt > 0 && c->wait_client_queue->cnt > 0) {
+            d->notify_left = true;
+        }
     }
-    if (st & INT_TXBHCI) {
-        ctucan_wr(&d->hw, CTUCAN_INT_STAT, INT_TXBHCI);
-        tx_retire(d);
-        tx_kick(d);
-    }
+    finish_pulse(d, false);
+    d->in_event = false;
 }
 
 static int fi_request(drv_t *d, const ctucan_fi_req_t *r)
@@ -776,7 +793,7 @@ static int restart_controller(drv_t *d)
     }
     ctucan_hw_start(&d->hw, &d->cfg, d->int_ena);
     d->suppressed = false;
-    d->txb_head = d->txb_tail = 0;
+    d->txb_head = d->txb_tail = d->txb_n = 0;
     tx_set_prio(d);
     d->fs = ctucan_rd(&d->hw, CTUCAN_EWL_ERP_FAULT) & FS_MASK;
     d->ewl = (ctucan_rd(&d->hw, CTUCAN_STATUS) & STAT_EWL) != 0;
