@@ -853,6 +853,27 @@ def t_fi_busoff_abort_notick(t, bus):
     return "4 frames stuck aborting dropped and counted at bus-off within the request (tx_abort_forced 4), hold kept"
 
 
+def t_fi_busoff_devctl_during_quiesce(t, bus):
+    """Bus-off with aborts that never finish: the driver returns to libcan's loop at once and answers the
+    next devctl while the aborts are pending; the deadline thread then ends the wait with no ticker or traffic."""
+    t.driver(variant=FI, force=True)
+    fi(t, 4, 5000, 4)
+    t.ssh(f"{TEST} seqsend {TX1} 2EA 16 4 0 >/dev/null")
+    x0 = t.xstats()
+    check(x0["inflight"] == 4, f"in flight before bus-off: {x0['inflight']}")
+    out = t.out(f"{TEST} fiprobe {RX0} 3 2 1")     # bus-off at once, aborts never finish, no ticker
+    mid = dict((k, int(v, 0)) for k, v in re.findall(r"(\w+) (0x[0-9a-f]+|\d+)", out))
+    check("No error" in out and "busoff_hold" in mid, out.strip())
+    check(mid["busoff_hold"] == 1 and mid["inflight"] == 4 and mid["tx_abort_forced"] == x0["tx_abort_forced"],
+          f"the devctl after bus-off was answered only after the quiesce ended: {mid}")
+    time.sleep(0.3)
+    x1 = t.xstats()
+    check(x1["busoff_hold"] == 1 and x1["inflight"] == 0 and x1["tx_abort_forced"] - x0["tx_abort_forced"] == 4,
+          f"after the deadline: {x1}")
+    return ("devctl answered with 4 aborts pending and bus-off hold set; the deadline thread then dropped and "
+            "counted them (tx_abort_forced +4), hold kept")
+
+
 def t_fi_rejected_normal(t, bus):
     """The normal build answers the fault-injection devctls like any unknown command."""
     t.driver(force=True)
@@ -1179,7 +1200,7 @@ ORDER = ["tx_lengths", "rx_lengths", "rtr", "ids", "write_path", "extended_mailb
          "fi_rejected_normal", "sigterm", "restart_under_load", "supervisor_readiness", "supervisor_hang",
          "ecu_sim", "two_nodes", "fi_warn",
          "fi_passive", "fi_busoff_auto", "fi_busoff_latch", "fi_busoff_manual", "fi_busoff_stuck_abort",
-         "fi_busoff_abort_notick", "fi_txdelay", "fi_tx_budget", "fi_quiesce", "fi_reset_retry", "fi_reset_storm",
+         "fi_busoff_abort_notick", "fi_busoff_devctl_during_quiesce", "fi_txdelay", "fi_tx_budget", "fi_quiesce", "fi_reset_retry", "fi_reset_storm",
          "fi_state_clear", "fi_batches", "fi_reader_budget", "fi_reader_nowake", "fi_tx_order", "fi_tx_order_fixed",
          "fi_rx_corrupt"]
 

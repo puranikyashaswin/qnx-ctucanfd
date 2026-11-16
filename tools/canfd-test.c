@@ -16,6 +16,7 @@
  *   canfd-test timing DEV BRP TS1 TS2 SJW
  *   canfd-test fi DEV SCENARIO [ARG ARG2 BUDGET FLAGS]   fault injection builds only
  *   canfd-test fitick DEV MS               drive a fault-injection script for MS ms
+ *   canfd-test fiprobe DEV SCENARIO [ARG ARG2]   start a scenario, then xstats at once from this process
  *   canfd-test monitor DEV MS              devctls back to back while traffic runs
  *   canfd-test pulse DEV CODE              send a pulse to the driver's channel
  *   canfd-test badsize DEV                 devctls with short payloads (expect EINVAL)
@@ -695,6 +696,17 @@ int main(int argc, char *argv[])
                               argc > 7 ? (uint32_t)strtoul(argv[7], NULL, 0) : 0 };
         rc = devctl(fd, CTUCAN_DEVCTL_FI, &r, sizeof(r), NULL);
         printf("CTUCAN_DEVCTL_FI: %s\n", strerror(rc));
+    } else if (strcmp(cmd, "fiprobe") == 0 && argc > 3) {
+        /* the xstats devctl follows the FI devctl from the same process, so
+         * its answer shows the driver's state right after the scenario began */
+        ctucan_fi_req_t r = { (uint32_t)strtoul(argv[3], NULL, 0),
+                              argc > 4 ? (uint32_t)strtoul(argv[4], NULL, 0) : 0,
+                              argc > 5 ? (uint32_t)strtoul(argv[5], NULL, 0) : 0, 0, 0 };
+        rc = devctl(fd, CTUCAN_DEVCTL_FI, &r, sizeof(r), NULL);
+        printf("CTUCAN_DEVCTL_FI: %s\n", strerror(rc));
+        if (rc == EOK) {
+            rc = do_xstats(fd);
+        }
     } else if (strcmp(cmd, "badsize") == 0) {
         /* each payload is shorter than its command needs */
         CAN_MSG m;
