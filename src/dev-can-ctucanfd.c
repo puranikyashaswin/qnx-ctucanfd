@@ -225,11 +225,18 @@ static int deadline_start(unsigned unit)
     int rc;
 
     g_dl.unit = unit;
-    if ((rc = pthread_condattr_init(&ca)) != EOK || (rc = pthread_condattr_setclock(&ca, CLOCK_MONOTONIC)) != EOK ||
-        (rc = pthread_cond_init(&g_dl.cv, &ca)) != EOK) {
+    if ((rc = pthread_condattr_init(&ca)) != EOK) {
         return rc;
     }
+    /* deadlines come from CLOCK_MONOTONIC (now_ms()), so the wait must use it too */
+    rc = pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
+    if (rc == EOK) {
+        rc = pthread_cond_init(&g_dl.cv, &ca);
+    }
     pthread_condattr_destroy(&ca);
+    if (rc != EOK) {
+        return rc;
+    }
     sigfillset(&all);
     pthread_sigmask(SIG_BLOCK, &all, &old);
     rc = pthread_create(&tid, NULL, deadline_thread, NULL);
