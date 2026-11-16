@@ -235,7 +235,12 @@ The codelab (`codelab/qnx-canfd-qemu.md`) walks through the same setup by hand.
 
 - Tested in QEMU 6.2 only. QEMU has no bit timing, error counters, fault confinement or bus timing.
 - The error and bus-off paths are tested only through the fault injector, which plays scripted register sequences to the driver (section 8).
-- The driver compiles and links for aarch64le; it has not run on ARM, and register access ordering and posted-write completion on ARM have not been reviewed.
+- The driver compiles and links for aarch64le; it has not run on ARM, and register access ordering and posted-write completion on ARM have not been reviewed against QNX's documentation. Every access is a volatile 32-bit load or store to memory mapped with `PROT_NOCACHE`, which keeps program order on x86_64. Whether QNX maps such memory on aarch64 so that accesses to one device stay in order, and whether a write must be read back before a kernel call, is not verified. These are the places where order matters:
+  - `tx_kick()`: the TXT buffer words (`ctucan_hw_txt_write()`) must reach the core before the TX_COMMAND that sets the buffer ready.
+  - `service()`: the TXBHCI acknowledge must reach the core before the TX_STATUS snapshot, or a buffer that finishes in between is missed.
+  - `finish_pulse()`: INT_ENA_CLR must take effect in the core before `InterruptUnmask()`, and INT_ENA_SET after it, or the output toggle of section 3.3 does not happen.
+  - `service()`: COMMAND.CDO before the DOI acknowledge (datasheet order).
+  - `ctucan_hw_start()`: mode and settings first, then a second write that sets ENA.
 - One active core per board: both cores of QEMU's board drive one interrupt line, and each core raises or lowers it on its own, so two driver instances on one board can lose interrupts. A second node needs a second board.
 - A shared interrupt line is handled in code (a pulse with nothing pending is counted as `spurious` and unmasked) but not tested: on tc only this driver is attached to IRQ 10 (`pidin irq`).
 - Interrupt pulses are not authenticated. Any process allowed to open `/dev/can1/*` can send a pulse with the interrupt code; with nothing masked the kernel refuses the unmask and the driver counts it, but a pulse that arrives while a real interrupt is pending would make the driver unmask early and the real pulse's unmask then fails (counted). The device permissions are the only guard.
