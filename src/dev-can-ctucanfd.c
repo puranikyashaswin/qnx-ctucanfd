@@ -13,9 +13,16 @@
  * interrupt status bit pending in the core, so the core interrupts again
  * after the unmask and the next pulse takes the next batch
  * (docs/DESIGN.md, section 3).
+ *
+ * Nothing on libcan's thread sleeps while the driver runs. At bus-off the
+ * driver aborts the frames in TXT buffers and returns; the aborts finish in
+ * later interrupt pulses, and a small deadline thread bounds the wait with a
+ * devctl to the driver's own device (section 8).
  */
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -24,6 +31,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <devctl.h>
 #include <sys/mman.h>
 #include <sys/neutrino.h>
 #include <sys/slog2.h>
@@ -40,7 +48,7 @@
 #define RX_BUDGET       64u     /* frames moved from the RX FIFO per pulse */
 #define PASS_LIMIT      8u      /* INT_STAT passes per pulse */
 #define REPORT_BUDGET   64u     /* RX mailbox returns to libcan per pulse */
-#define TX_QUIESCE_MS   20u     /* wait for frames in flight, then as long again after an abort */
+#define TX_QUIESCE_MS   20u     /* bound for TXT buffers to finish or abort */
 #define STUCK_LIMIT     8u      /* pulses in a row a mailbox may be returned without waking anyone */
 
 #define container_of(p, type, member) ((type *)(void *)((char *)(p) - offsetof(type, member)))
@@ -108,6 +116,10 @@ struct drv {
     uint32_t fs;                    /* last FAULT_STATE bits */
     bool     ewl;                   /* last STATUS.EWL, tracked apart from FAULT_STATE */
     bool     busoff_hold;           /* set at bus-off, cleared only by FAULT_STATE = error active */
+    struct {
+        bool     active;            /* bus-off aborts issued, not all final yet */
+        uint64_t deadline_ms;       /* then whatever is not final is given up */
+    } quiesce;
 
     uint32_t         ts_offset;     /* timestamps: ctucanfd_time.h */
     CAN_DEVCTL_STATS stats;
@@ -147,6 +159,98 @@ static uint64_t now_ms(void)
 }
 
 static void fi_tick(drv_t *d);
+
+/* ---- deadline thread ---------------------------------------------------- */
+
+/* libcan runs every callback on its one thread and offers the driver no
+ * timer. The bus-off abort deadline therefore comes from a thread of our own:
+ * it sleeps until the deadline and then sends CTUCAN_DEVCTL_QUIESCE to the
+ * driver's own rx0, an ordinary client message that libcan's thread serves in
+ * its turn. The thread never touches driver state; it shares only the
+ * deadline, under its own mutex, and it never holds that mutex while it
+ * sends. If it cannot run, the next interrupt pulse still enforces the
+ * deadline. */
+static struct {
+    pthread_mutex_t mtx;
+    pthread_cond_t  cv;
+    uint64_t        due_ms;         /* 0: nothing armed */
+    unsigned        unit;
+    unsigned        send_err;       /* devctls to ourselves that failed */
+    bool            up;
+} g_dl = { .mtx = PTHREAD_MUTEX_INITIALIZER };
+
+static void *deadline_thread(void *arg)
+{
+    int fd = -1;
+
+    (void)arg;
+    pthread_mutex_lock(&g_dl.mtx);
+    for (;;) {
+        while (g_dl.due_ms == 0) {
+            pthread_cond_wait(&g_dl.cv, &g_dl.mtx);
+        }
+        uint64_t due = g_dl.due_ms;
+        if (now_ms() < due) {
+            struct timespec ts = { (time_t)(due / 1000u), (long)(due % 1000u) * 1000000L };
+            pthread_cond_timedwait(&g_dl.cv, &g_dl.mtx, &ts);
+            continue;   /* due now, disarmed or moved: look again */
+        }
+        g_dl.due_ms = 0;
+        pthread_mutex_unlock(&g_dl.mtx);
+        if (fd == -1) {
+            char path[32];
+            snprintf(path, sizeof(path), "/dev/can%u/rx0", g_dl.unit);
+            fd = open(path, O_RDWR);
+        }
+        int rc = fd == -1 ? errno : devctl(fd, CTUCAN_DEVCTL_QUIESCE, NULL, 0, NULL);
+        pthread_mutex_lock(&g_dl.mtx);
+        if (rc != EOK) {
+            g_dl.send_err++;
+            if (fd != -1) {
+                close(fd);
+                fd = -1;
+            }
+        }
+    }
+    return NULL;
+}
+
+/* Starts the thread with every signal blocked, so SIGTERM still reaches the
+ * thread libcan expects it on. */
+static int deadline_start(unsigned unit)
+{
+    pthread_condattr_t ca;
+    pthread_t tid;
+    sigset_t all, old;
+    int rc;
+
+    g_dl.unit = unit;
+    if ((rc = pthread_condattr_init(&ca)) != EOK || (rc = pthread_condattr_setclock(&ca, CLOCK_MONOTONIC)) != EOK ||
+        (rc = pthread_cond_init(&g_dl.cv, &ca)) != EOK) {
+        return rc;
+    }
+    pthread_condattr_destroy(&ca);
+    sigfillset(&all);
+    pthread_sigmask(SIG_BLOCK, &all, &old);
+    rc = pthread_create(&tid, NULL, deadline_thread, NULL);
+    pthread_sigmask(SIG_SETMASK, &old, NULL);
+    if (rc == EOK) {
+        pthread_detach(tid);
+        g_dl.up = true;
+    }
+    return rc;
+}
+
+static void deadline_set(uint64_t due_ms)
+{
+    if (!g_dl.up) {
+        return;
+    }
+    pthread_mutex_lock(&g_dl.mtx);
+    g_dl.due_ms = due_ms;
+    pthread_cond_signal(&g_dl.cv);
+    pthread_mutex_unlock(&g_dl.mtx);
+}
 
 /* ---- transmit ---------------------------------------------------------- */
 
@@ -339,13 +443,19 @@ static void tx_force_retire(drv_t *d)
     }
 }
 
-/* Stops TX admission and waits for the TXT buffers to finish: up to `ms` for
- * a normal completion, then an abort and up to `ms` again. Frames that are
- * aborted are dropped and counted; frames still in libcan's queues stay there. */
-static int tx_quiesce(drv_t *d, unsigned ms)
+/* Stops TX admission and waits for the TXT buffers to be final. With
+ * `finish_first` it waits up to `ms` for a normal completion, then aborts and
+ * waits up to `ms` again (shutdown); without it, it aborts at once and waits
+ * up to `ms` once (SET_TIMING restart, on libcan's thread while clients
+ * wait). Frames that are aborted are dropped and counted; frames still in
+ * libcan's queues stay there. */
+static int tx_quiesce(drv_t *d, unsigned ms, bool finish_first)
 {
     d->tx_stopped = true;
-    for (int phase = 0; phase < 2; phase++) {
+    if (!finish_first) {
+        tx_abort_inflight(d);
+    }
+    for (int phase = finish_first ? 0 : 1; phase < 2; phase++) {
         uint64_t end = now_ms() + ms;
         for (;;) {
             fi_tick(d);
@@ -441,9 +551,39 @@ static unsigned rx_drain(drv_t *d, unsigned budget)
 
 /* ---- errors ------------------------------------------------------------ */
 
-/* Bus-off: TX is held and the frames in TXT buffers are aborted. The aborts
- * are waited for here, at most TX_QUIESCE_MS, and whatever is still not final
- * then is given up; nothing relies on later traffic or a timer for that. */
+/* Ends a bus-off quiesce: what is not final is given up and counted, and
+ * with -a recovery is requested now that no TXT buffer is in use (not when
+ * the core has already left bus-off). */
+static void quiesce_finish(drv_t *d, bool recover)
+{
+    tx_force_retire(d);
+    d->quiesce.active = false;
+    deadline_set(0);
+    if (recover && d->autobus) {
+        ctucan_wr(&d->hw, CTUCAN_COMMAND, CMD_ERCRST);
+    }
+}
+
+/* Runs on every interrupt pulse, fault-injection tick and deadline devctl
+ * while a bus-off quiesce is open: done once every TXT buffer is final or
+ * the deadline has passed, whichever comes first. */
+static void quiesce_check(drv_t *d)
+{
+    if (!d->quiesce.active) {
+        return;
+    }
+    fi_tick(d);
+    tx_retire(d);
+    if (tx_inflight(d) == 0 || now_ms() >= d->quiesce.deadline_ms) {
+        quiesce_finish(d, true);
+    }
+}
+
+/* Bus-off: TX is held and the frames in TXT buffers are aborted, and the
+ * driver returns to libcan's loop at once. Abort completions arrive as TX
+ * buffer interrupts; whatever is still not final TX_QUIESCE_MS later is given
+ * up when the deadline thread's devctl arrives, with no traffic or fault-
+ * injection ticker needed (test fi_busoff_abort_notick). */
 static void enter_busoff(drv_t *d, uint32_t cnt)
 {
     d->stats.bus_off_state_count++;
@@ -451,20 +591,10 @@ static void enter_busoff(drv_t *d, uint32_t cnt)
     can_slogf(SLOG2_WARNING, DRV_NAME ": bus-off (TEC %u REC %u): TX held, %u frame(s) in TXT buffers aborted%s",
               CNT_TEC(cnt), CNT_REC(cnt), tx_inflight(d), d->autobus ? ", recovery requested" : "");
     tx_abort_inflight(d);
-    uint64_t end = now_ms() + TX_QUIESCE_MS;
-    for (;;) {
-        fi_tick(d);
-        tx_retire(d);
-        if (tx_inflight(d) == 0 || now_ms() >= end) {
-            break;
-        }
-        struct timespec ts = { 0, 200000 };
-        nanosleep(&ts, NULL);
-    }
-    tx_force_retire(d);
-    if (d->autobus) {
-        ctucan_wr(&d->hw, CTUCAN_COMMAND, CMD_ERCRST);
-    }
+    d->quiesce.active = true;
+    d->quiesce.deadline_ms = now_ms() + TX_QUIESCE_MS;
+    deadline_set(d->quiesce.deadline_ms);
+    quiesce_check(d);   /* nothing in flight, or aborts already final: done now */
 }
 
 static void error_event(drv_t *d, uint32_t st)
@@ -511,6 +641,9 @@ static void error_event(drv_t *d, uint32_t st)
                       d->busoff_hold ? ", TX still held after bus-off" : "");
         } else if (fs & FS_ERA) {
             if (d->busoff_hold) {
+                if (d->quiesce.active) {
+                    quiesce_finish(d, false);   /* old frames go before TX resumes, never new ones */
+                }
                 d->busoff_hold = false;
                 d->x.busoff_recovered++;
                 can_slogf(SLOG2_WARNING, DRV_NAME ": bus-off recovery confirmed, TX resumes");
@@ -584,6 +717,7 @@ static void service(drv_t *d)
     if (moved > d->x.rx_max_batch) {
         d->x.rx_max_batch = moved;
     }
+    quiesce_check(d);
 }
 
 /* A mailbox whose returns keep waking nobody: its queued frames are dropped
@@ -751,6 +885,7 @@ static void fi_devctl_tick(drv_t *d)
         tx_retire(d);
         tx_kick(d);
     }
+    quiesce_check(d);
 }
 
 static int fi_request(drv_t *d, const ctucan_fi_req_t *r)
@@ -783,7 +918,11 @@ static void fi_tick(drv_t *d)
 
 static int restart_controller(drv_t *d)
 {
-    int rc = d->hw_started ? tx_quiesce(d, TX_QUIESCE_MS) : EOK;
+    if (d->quiesce.active) {
+        d->quiesce.active = false;  /* the restart aborts and resets everything anyway */
+        deadline_set(0);
+    }
+    int rc = d->hw_started ? tx_quiesce(d, TX_QUIESCE_MS, false) : EOK;
 
     /* the reset empties the RX FIFO: count what it held */
     d->x.rx_flushed += ctucan_hw_rx_frames(&d->hw);
@@ -858,8 +997,12 @@ static void dump_regs(const drv_t *d)
     for (size_t i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
         can_slogf(SLOG2_INFO, DRV_NAME ": %-12s 0x%08x", regs[i].name, ctucan_rd(&d->hw, regs[i].off));
     }
-    can_slogf(SLOG2_INFO, DRV_NAME ": pulses %u, deferred %u, unmask_err %u, in flight %u, bus-off hold %d",
-              d->x.hw_pulses, d->x.deferred, d->x.unmask_err, tx_inflight(d), d->busoff_hold);
+    pthread_mutex_lock(&g_dl.mtx);
+    unsigned dl_err = g_dl.send_err;
+    pthread_mutex_unlock(&g_dl.mtx);
+    can_slogf(SLOG2_INFO, DRV_NAME ": pulses %u, deferred %u, unmask_err %u, in flight %u, bus-off hold %d, "
+              "quiesce %d, deadline thread %s, %u failed send(s)", d->x.hw_pulses, d->x.deferred, d->x.unmask_err,
+              tx_inflight(d), d->busoff_hold, d->quiesce.active, g_dl.up ? "up" : "not running", dl_err);
 }
 
 static int cb_devctl(CANDEV *cdev, io_devctl_t *msg)
@@ -979,6 +1122,10 @@ static int cb_devctl(CANDEV *cdev, io_devctl_t *msg)
     case CTUCAN_DEVCTL_GET_FDSTATS:
         memcpy(out, &d->fdx, sizeof(d->fdx));
         rc = sizeof(d->fdx);
+        break;
+    case CTUCAN_DEVCTL_QUIESCE:
+        quiesce_check(d);   /* from the deadline thread; from anyone else only an early check */
+        rc = EOK;
         break;
     case CTUCAN_DEVCTL_RECOVER:
         /* manual bus-off recovery when -a is not set; TX resumes once FAULT_STATE reads error active */
@@ -1232,8 +1379,9 @@ static int attach_irq(drv_t *d)
 /* Undoes whatever main() got done, in reverse order. */
 static void teardown(drv_t *d)
 {
+    deadline_set(0);
     if (d->hw_started) {
-        tx_quiesce(d, TX_QUIESCE_MS);
+        tx_quiesce(d, TX_QUIESCE_MS, true);     /* at exit: let frames finish first */
     }
     if (d->map != NULL) {
         ctucan_hw_stop(&d->hw);     /* also after a failed restart: leave the core off the bus */
@@ -1348,6 +1496,10 @@ int main(int argc, char *argv[])
         }
     }
 
+    if ((rc = deadline_start(d->unit)) != EOK) {
+        can_slogf(SLOG2_ERROR, DRV_NAME ": deadline thread: %s; bus-off aborts are bounded by the next interrupt",
+                  strerror(rc));
+    }
     can_resmgr_start();     /* returns after SIGTERM */
 
     can_slogf(SLOG2_INFO, DRV_NAME ": stopping, %u frame(s) in TXT buffers", tx_inflight(d));

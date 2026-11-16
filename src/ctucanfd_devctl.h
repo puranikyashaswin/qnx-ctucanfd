@@ -83,5 +83,9 @@ typedef struct {
  * 32-bit timestamp of frames and CAN_DEVCTL_GET_TIMESTAMP (src/ctucanfd_time.h) */
 #define CTUCAN_DEVCTL_GET_TIMESTAMP64 (__DIOF(_DCMD_MISC, CTUCAN_DCMD_CODE + 4, uint64_t))
 #define CTUCAN_DEVCTL_GET_FDSTATS (__DIOF(_DCMD_MISC, CTUCAN_DCMD_CODE + 5, ctucan_fdstats_t))
+/* Sent by the driver's deadline thread to the driver itself when a bus-off
+ * abort deadline is due. From any other client it only makes the driver check
+ * earlier; it never ends a wait before its deadline. */
+#define CTUCAN_DEVCTL_QUIESCE    (__DION(_DCMD_MISC, CTUCAN_DCMD_CODE + 6))
 
 #endif
