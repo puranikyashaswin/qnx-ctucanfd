@@ -62,6 +62,7 @@ static void test_start(void)
 
     CHECK_EQ(ctucan_bt_calc(100000000u, 500000u, 875, false, &cfg.nominal), 0);
     CHECK_EQ(ctucan_bt_calc(100000000u, 2000000u, 750, true, &cfg.data), 0);
+    cfg.ssp_cfg = ctucan_ssp_cfg(100000000u, 2000000u, 750);
     start_with(&cfg, ena);
 
     /* the output is off first and on last, after the core is enabled */
@@ -82,6 +83,8 @@ static void test_start(void)
     CHECK_EQ(fake_last_write(CTUCAN_BTR), ctucan_bt_reg(&cfg.nominal));
     CHECK_EQ(fake_last_write(CTUCAN_BTR_FD), ctucan_bt_reg(&cfg.data));
     CHECK(write_at(CTUCAN_BTR_FD, 0) < write_at(CTUCAN_MODE, 0), "BTR_FD after MODE");
+    CHECK_EQ(fake_last_write(CTUCAN_TRV_DELAY), cfg.ssp_cfg);
+    CHECK(write_at(CTUCAN_TRV_DELAY, 0) < write_at(CTUCAN_MODE, 0), "SSP set after the core was enabled");
     CHECK_EQ(fake_last_write(CTUCAN_COMMAND), CMD_RRB | CMD_CDO | CMD_RXFCRST | CMD_TXFCRST);
 
     uint32_t mode = fake_last_write(CTUCAN_MODE);

@@ -68,6 +68,7 @@ void ctucan_hw_start(const ctucan_hw_t *hw, const ctucan_hw_cfg_t *cfg, uint32_t
     ctucan_wr(hw, CTUCAN_INT_STAT, INT_ALL);
     ctucan_wr(hw, CTUCAN_BTR, ctucan_bt_reg(&cfg->nominal));
     ctucan_wr(hw, CTUCAN_BTR_FD, ctucan_bt_reg(&cfg->data));
+    ctucan_wr(hw, CTUCAN_TRV_DELAY, cfg->ssp_cfg);    /* only while the core is off */
     ctucan_wr(hw, CTUCAN_COMMAND, CMD_RRB | CMD_CDO | CMD_RXFCRST | CMD_TXFCRST);
 
     if (cfg->fd) {
@@ -243,8 +244,9 @@ int ctucan_bt_check(const ctucan_bt_t *bt, bool data_phase)
 {
     const unsigned prop_max = data_phase ? 63u : 127u;
     const unsigned ph_max = data_phase ? 31u : 63u;
+    const unsigned brp_max = data_phase ? SSP_DBRP_MAX : 255u;
 
-    if (bt->brp < 1 || bt->brp > 255 || bt->prop > prop_max || bt->ph1 > ph_max || bt->ph2 < 1 ||
+    if (bt->brp < 1 || bt->brp > brp_max || bt->prop > prop_max || bt->ph1 > ph_max || bt->ph2 < 1 ||
         bt->ph2 > ph_max || bt->prop + bt->ph1 < 2u) {
         return EINVAL;
     }
@@ -271,7 +273,7 @@ int ctucan_bt_calc(uint32_t clk_hz, uint32_t bitrate, unsigned sp_permille, bool
     }
     /* First pass prefers at most 50 time quanta per bit, second takes any. */
     for (int pass = 0; pass < 2; pass++) {
-        for (unsigned brp = 1; brp <= 255; brp++) {
+        for (unsigned brp = 1; brp <= (data_phase ? SSP_DBRP_MAX : 255u); brp++) {
             uint64_t q = (uint64_t)brp * bitrate;
             if (clk_hz % q != 0) {
                 continue;
@@ -310,4 +312,23 @@ uint32_t ctucan_bt_reg(const ctucan_bt_t *bt)
     return ((uint32_t)bt->prop << BTR_PROP_SHIFT) | ((uint32_t)bt->ph1 << BTR_PH1_SHIFT) |
            ((uint32_t)bt->ph2 << BTR_PH2_SHIFT) | ((uint32_t)bt->brp << BTR_BRP_SHIFT) |
            ((uint32_t)bt->sjw << BTR_SJW_SHIFT);
+}
+
+/*
+ * Above 1 Mbit/s the transmitter's own bits come back from the transceiver
+ * too late to be checked at the data sample point, so the core checks them
+ * at a secondary sample point: its measured transmitter delay plus an offset,
+ * here the data sample point counted in clock cycles from the start of the
+ * bit. At 1 Mbit/s and below the normal sample point is used.
+ */
+uint32_t ctucan_ssp_cfg(uint32_t clk_hz, uint32_t dbitrate, unsigned dsp_permille)
+{
+    if (dbitrate <= 1000000u) {
+        return SSP_SRC_NO_SSP << SSP_SRC_SHIFT;
+    }
+    uint64_t off = (uint64_t)clk_hz * dsp_permille / (1000u * (uint64_t)dbitrate);
+    if (off > SSP_OFFSET_MAX) {
+        off = SSP_OFFSET_MAX;
+    }
+    return SSP_SRC_MEAS_N_OFFSET << SSP_SRC_SHIFT | (uint32_t)off << SSP_OFFSET_SHIFT;
 }

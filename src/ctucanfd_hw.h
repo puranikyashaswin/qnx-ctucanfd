@@ -36,6 +36,7 @@ typedef struct {
     bool listen_only;           /* MODE.BMM */
     ctucan_bt_t nominal;
     ctucan_bt_t data;
+    uint32_t ssp_cfg;           /* CTUCAN_TRV_DELAY word, from ctucan_ssp_cfg() */
 } ctucan_hw_cfg_t;
 
 typedef struct {
@@ -94,6 +95,7 @@ int      ctucan_bt_calc(uint32_t clk_hz, uint32_t bitrate, unsigned sp_permille,
                         ctucan_bt_t *bt);
 int      ctucan_bt_check(const ctucan_bt_t *bt, bool data_phase);
 uint32_t ctucan_bt_reg(const ctucan_bt_t *bt);
+uint32_t ctucan_ssp_cfg(uint32_t clk_hz, uint32_t dbitrate, unsigned dsp_permille);
 
 #ifdef CTUCAN_FI
 enum {

@@ -816,6 +816,7 @@ static int set_timing(drv_t *d, const CAN_DEVCTL_TIMING *t)
     d->clk_hz = clk;
     d->cfg.nominal = bt;
     d->cfg.data = data;
+    d->cfg.ssp_cfg = ctucan_ssp_cfg(clk, d->fd ? d->dbitrate : 0, d->dsp);
     d->bitrate = rate;
     int rc = restart_controller(d);
     can_slogf(SLOG2_INFO, DRV_NAME ": timing brp %u ts1 %u ts2 %u sjw %u -> %u bit/s%s", bt.brp, ts1, ts2,
@@ -1059,6 +1060,7 @@ static int parse_args(drv_t *d, int argc, char *argv[])
                 d->clk_hz);
         return EINVAL;
     }
+    d->cfg.ssp_cfg = ctucan_ssp_cfg(d->clk_hz, d->fd ? d->dbitrate : 0, d->dsp);
     return EOK;
 }
 

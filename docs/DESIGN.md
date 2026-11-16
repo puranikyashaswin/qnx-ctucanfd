@@ -164,6 +164,7 @@ The framework carries CAN FD: `CAN_MSG.dat[CAN_MSG_DATA_MAX]` with `CAN_MSG_DATA
 - Lengths are rounded up to the next CAN FD size (12, 16, 20, 24, 32, 48, 64) and zero padded; the `tx_lengths` test checks every length from 0 to 64 on vcan0, payload and padding byte for byte.
 - `CAN_DEVCTL_WRITE_CANMSG_EXT` is refused (EINVAL) above 64 bytes (8 in classic mode), and for a remote frame that would have to be CAN FD (more than 8 bytes, or `-A`), since CAN FD has no remote frames. Remote frames of up to 8 bytes go out as classic RTR frames.
 - RX accepts classic and CAN FD frames alike. The API cannot report FDF, BRS or ESI to clients; carrying them in `CAN_MSG.rsv` would need QNX's agreement.
+- Transmitter delay compensation: above 1 Mbit/s data rate the driver writes the TRV_DELAY word (offset 0x80, SSP_CFG half) before it enables the core: secondary sample point at the measured transmitter delay plus the data sample point in clock cycles (37 at the defaults), saturated at 127; at 1 Mbit/s and below, none. The data prescaler is limited to 2. The offset, field layout and encodings (core 2.x) and the prescaler limit are from memory of the CTU CAN FD datasheet and the Linux ctucanfd driver, not from a document in this repository. QEMU 6.2 does not implement the word, and nothing here has run on silicon, so this is checked only by the host unit tests (register values).
 
 QEMU's host bridge enables CAN FD only when the host interface MTU is 72 (`CANFD_MTU`), so `host-vcan.sh` sets `mtu 72`.
 
@@ -233,6 +234,7 @@ The codelab (`codelab/qnx-canfd-qemu.md`) walks through the same setup by hand.
 ## 11. Known limits
 
 - Tested in QEMU 6.2 only. QEMU has no bit timing, error counters, fault confinement or bus timing.
+- The secondary sample point and the data prescaler limit (section 6) follow a remembered register layout and have not been checked against the datasheet or run on silicon.
 - The error and bus-off paths are tested only through the fault injector, which plays scripted register sequences to the driver (section 8).
 - The driver compiles and links for aarch64le; it has not run on ARM, and register access ordering and posted-write completion on ARM have not been reviewed.
 - One active core per board: both cores of QEMU's board drive one interrupt line, and each core raises or lowers it on its own, so two driver instances on one board can lose interrupts. A second node needs a second board.

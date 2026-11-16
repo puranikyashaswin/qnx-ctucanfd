@@ -50,6 +50,37 @@ static void test_bt_defaults(void)
     CHECK(d.ph1 <= 31 && d.ph2 <= 31 && d.prop <= 63, "data phase fields out of range");
 }
 
+/* The secondary sample point word: the data sample point in clock cycles
+ * above 1 Mbit/s, none at or below. */
+static void test_ssp(void)
+{
+    uint32_t v = ctucan_ssp_cfg(100000000u, 2000000u, 750);
+
+    CHECK_EQ((v >> SSP_SRC_SHIFT) & 3u, SSP_SRC_MEAS_N_OFFSET);
+    CHECK_EQ((v >> SSP_OFFSET_SHIFT) & 0xffu, 37);  /* 50 cycles per bit, sample point at 75 % */
+    CHECK_EQ(v & 0xffffu, 0);                       /* the read-only half stays 0 */
+    v = ctucan_ssp_cfg(80000000u, 5000000u, 800);
+    CHECK_EQ((v >> SSP_OFFSET_SHIFT) & 0xffu, 12);
+    CHECK_EQ(ctucan_ssp_cfg(100000000u, 1000000u, 750), SSP_SRC_NO_SSP << SSP_SRC_SHIFT);
+    CHECK_EQ(ctucan_ssp_cfg(100000000u, 0, 750), SSP_SRC_NO_SSP << SSP_SRC_SHIFT);
+    v = ctucan_ssp_cfg(400000000u, 1500000u, 900);  /* 240 cycles: saturates */
+    CHECK_EQ((v >> SSP_OFFSET_SHIFT) & 0xffu, SSP_OFFSET_MAX);
+}
+
+/* With a secondary sample point the data prescaler stays at 2 or below. */
+static void test_data_brp_cap(void)
+{
+    ctucan_bt_t bt;
+
+    /* 250 kbit/s data at 100 MHz needs a prescaler of 4 */
+    CHECK_EQ(ctucan_bt_calc(100000000u, 250000u, 750, true, &bt), EINVAL);
+    CHECK_EQ(ctucan_bt_calc(100000000u, 500000u, 750, true, &bt), 0);
+    CHECK_EQ(bt.brp, 2);
+    bt = (ctucan_bt_t){ .brp = 3, .prop = 6, .ph1 = 6, .ph2 = 3, .sjw = 3 };
+    CHECK_EQ(ctucan_bt_check(&bt, true), EINVAL);
+    CHECK_EQ(ctucan_bt_check(&bt, false), 0);
+}
+
 /* Every result must give the bit rate exactly, pass ctucan_bt_check() and put
  * the sample point within half a time quantum of the one asked for. */
 static void test_bt_properties(void)
@@ -72,6 +103,7 @@ static void test_bt_properties(void)
                         continue;
                     }
                     found++;
+                    CHECK(!phase || bt.brp <= SSP_DBRP_MAX, "data brp %u", bt.brp);
                     unsigned ntq = 1u + bt.prop + bt.ph1 + bt.ph2;
                     CHECK((uint64_t)bt.brp * ntq * rates[r] == clocks[c], "clk %u rate %u: brp %u ntq %u",
                           clocks[c], rates[r], bt.brp, ntq);
@@ -140,6 +172,8 @@ int main(void)
 {
     test_dlc();
     test_bt_defaults();
+    test_ssp();
+    test_data_brp_cap();
     test_bt_properties();
     test_bt_refused();
     test_bt_check();

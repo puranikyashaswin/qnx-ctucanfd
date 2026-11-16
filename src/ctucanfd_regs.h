@@ -43,6 +43,7 @@
 #define CTUCAN_TX_COMMAND       0x74u
 #define CTUCAN_TX_PRIORITY      0x78u   /* 3 bits per TXT buffer, nibble aligned */
 #define CTUCAN_ERR_CAPT         0x7cu   /* ERR_POS [4:0], ERR_TYPE [7:5], ALC [31:16] */
+#define CTUCAN_TRV_DELAY        0x80u   /* TRV_DELAY [6:0] (read only), SSP_CFG [31:16] */
 #define CTUCAN_RX_FR_CTR        0x84u
 #define CTUCAN_TX_FR_CTR        0x88u
 #define CTUCAN_YOLO             0x90u
@@ -134,6 +135,17 @@
 #define TXC_TXCA        (1u << 2)   /* -> abort */
 #define TXC_TXB(n)      (1u << (8u + (n)))
 #define TXC_TXB_MASK(m) ((uint32_t)(m) << 8u)   /* m: bit n = TXT buffer n */
+
+/* SSP_CFG in CTUCAN_TRV_DELAY: the secondary sample point that checks the
+ * transmitter's own bits in the data phase. Field layout of core 2.x as
+ * recalled from the datasheet; not checked against silicon. */
+#define SSP_OFFSET_SHIFT    16u     /* clock cycles, 8 bits */
+#define SSP_OFFSET_MAX      127u    /* the Linux ctucanfd driver saturates here */
+#define SSP_SRC_SHIFT       24u
+#define SSP_SRC_MEAS_N_OFFSET 0u    /* measured transmitter delay + SSP_OFFSET */
+#define SSP_SRC_NO_SSP      1u      /* check at the normal sample point */
+#define SSP_SRC_OFFSET      2u      /* SSP_OFFSET only */
+#define SSP_DBRP_MAX        2u      /* data phase prescaler limit with a secondary sample point */
 
 /* ERR_CAPT error types */
 #define ERRT_BIT        0u
