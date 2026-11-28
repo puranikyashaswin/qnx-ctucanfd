@@ -1,5 +1,7 @@
 # CAN FD for QNX 8.0 in QEMU
 
+QNX OS 8.0 | target: x86_64 in QEMU 6.2, board `ctucan_pci` (aarch64le compiles and links, not run) | toolchain: QNX SDP 8.0, `qcc -Vgcc_ntox86_64`
+
 [![Host checks](https://github.com/NikhilGogu/qnx-ctucanfd/actions/workflows/checks.yml/badge.svg)](https://github.com/NikhilGogu/qnx-ctucanfd/actions/workflows/checks.yml)
 
 Test a QNX CAN FD program without a CAN board. `dev-can-ctucanfd` is a native QNX 8.0 driver for the CTU CAN FD controller that QEMU emulates as the PCI board `ctucan_pci`. It is built on the QNX CAN DDK (`libcan`) and gives QNX programs the usual libcan devices, `/dev/can1/rx0` and `/dev/can1/tx1`, with 64-byte CAN FD payloads. QEMU bridges the virtual CAN bus to SocketCAN on the Linux host, so `candump` and `cansend` there see and send the frames.
@@ -38,6 +40,15 @@ The codelab's source is in [codelab/](codelab/qnx-canfd-qemu.md), and [codelab/D
 | Design | The Quickstart below and the codelab. `ctucan-supervisor` restarts the driver. The stock `canctl` works ([docs/DESIGN.md](docs/DESIGN.md), section 7) |
 | Potential impact | CAN FD application code for QNX tested with no CAN bench: `tools/ecu-sim.c` and `canfd-test tester` are the example application and its tester, and `scripts/test-suite.sh` runs the whole suite unattended and exits non-zero on any failure |
 | Innovation | Bounded interrupt batches with one `InterruptUnmask()` per pulse, and the interrupt output toggle that closed a lost-interrupt race ([docs/DESIGN.md](docs/DESIGN.md), sections 3.2 and 3.3). Error and bus-off paths tested through a fault injector that QEMU's model lacks (section 8). Recovery by restarting a plain process under a supervisor |
+
+## Where QNX shows
+
+- Resource manager: `src/dev-can-ctucanfd.c` calls `can_resmgr_init()`, `can_resmgr_init_device()`, `can_resmgr_create_device()` and `can_resmgr_start()` in `main()` and its setup code. The result is `/dev/can1/rx0` and `/dev/can1/tx1`, in the driver's start line shown below and in the `readers` and `writers` results in [docs/test-results.txt](docs/test-results.txt).
+- Devctl: `cb_devctl()` in the same file answers the `CAN_DEVCTL_*` commands. The driver's own commands are in `src/ctucanfd_devctl.h`. The `devctl_sizes` result shows bad sizes refused. The stock `canctl -u1,tx1 -i` works too (see Use below).
+- Interrupt attach and pulses: `can_resmgr_attach_intr()` ties IRQ 10 to the pulse code `PULSE_CODE_IRQ`. `cb_event()` serves each pulse and `finish_pulse()` ends it with one `InterruptUnmask()`. The `burst_batches` and `spoofed_irq_pulse` results cover it. The wait timer sends its pulse from `src/ctucanfd_timer.c` (`SIGEV_PULSE_INIT`).
+- Supervisor restart: `tools/ctucan-supervisor.c` uses `procmgr_event_notify()`, `ConnectServerInfo()` and `posix_spawn()` in `main()` and `probe()`. The results are `restart_under_load`, `supervisor_readiness` and `supervisor_hang`. The codelab step "Kill the driver and let the supervisor restart it" shows the log, with the picture `codelab/supervisor-restart.png`.
+- Real-time thread: `tools/ecu-sim.c` sends from a `SCHED_FIFO` thread with `clock_nanosleep()`. The `ecu_sim` and `two_nodes` results show its frames.
+- QNX test suite: `scripts/test-suite.sh` runs `scripts/gate-test.sh` and the tests in `scripts/tests/ctutest.py` (the list is `ORDER`) on a QNX target in QEMU. [docs/test-results.txt](docs/test-results.txt) is the recorded run, and [docs/TESTS.md](docs/TESTS.md) has the later runs.
 
 ## What you see
 
